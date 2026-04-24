@@ -1,0 +1,20 @@
+# Arduino build artifacts
+build/
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files
+.vscode/
+*.swp
+*~
+
+# Windows
+$RECYCLE.BIN/
