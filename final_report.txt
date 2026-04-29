@@ -1,0 +1,280 @@
+EECS 300 Final Report — People Counter
+
+
+1. Introduction
+
+Accurately tracking the number of occupants in a room is useful for applications ranging from
+building energy management to event capacity monitoring. This project implements an automatic
+people counter that mounts at a doorway and uses sensor fusion to detect and count individuals
+as they pass through, distinguishing between entries and exits and handling the case where two
+people cross simultaneously.
+
+The system is built around an ESP32 microcontroller, which hosts two parallel tasks: a sensing
+loop on core 1 that reads IR tripwire beams and Time-of-Flight (ToF) distance sensors to
+determine direction and occupancy count, and a WiFi communication task on core 0 that
+continuously transmits the current count to a remote server.
+
+
+2. System Requirements
+
+The system was designed to meet the following requirements:
+
+- Detect when a person enters or exits a room through a doorway and update a running count
+  accordingly.
+- Correctly determine the direction of travel (entering vs. exiting) for each crossing.
+- Detect and correctly count the case where two people pass through the doorway simultaneously,
+  incrementing or decrementing by 2.
+- Transmit the current count wirelessly to a server in real time.
+- Support a remote reset command from the server, persisting the reset count across power cycles
+  using non-volatile memory.
+
+
+3. Hardware Design
+
+3.1 Microcontroller
+
+The system uses an ESP32 development board, chosen for its dual-core Xtensa LX6 processor and
+integrated WiFi/Bluetooth radio. The two cores allow sensing and wireless communication to run
+as independent FreeRTOS tasks without one blocking the other.
+
+3.2 Tripwire Sensors (Direction Detection)
+
+Two IR tripwire sensors are positioned horizontally across the doorway, one closer to the
+outside of the room (OUTER, connected to analog pin 32) and one closer to the inside (INNER,
+connected to analog pin 33). A person walking through breaks the beams in a predictable order:
+outer first then inner for entries, inner first then outer for exits. Each sensor output is
+read as an analog value; a reading below 1000 is treated as broken and above 1500 as clear,
+with a debounce counter requiring consecutive below-threshold readings before the state changes.
+
+3.3 Time-of-Flight Sensors (Two-Person Detection)
+
+Two VL53L1X laser ToF sensors are mounted in the doorway to estimate the width of the crossing
+object. Both sensors communicate over I2C (SDA on GPIO 21, SCL on GPIO 22). Because both
+sensors share the same I2C bus and default to the same address, their XSHUT shutdown pins
+(GPIO 25 and GPIO 26) are used to bring them up sequentially and assign them distinct addresses
+(0x30 and 0x31). Each sensor runs a 50 ms timing budget and reports distances in millimeters.
+If both sensors read a distance below 700 mm within a 500 ms window of each other, the system
+infers that two people are side by side and activates two-person mode.
+
+3.4 Hardware Evolution
+
+The project went through three hardware iterations. The initial prototype used only the two IR
+tripwire sensors for direction detection. A second iteration added two HC-SR04 ultrasonic
+sensors (trigger pins 22/21, echo pins 26/25) for two-person detection, with a maximum range
+of approximately 4 m at a pulse timeout of 23,200 us. The ultrasonic sensors were later
+replaced with VL53L0X ToF sensors (I2C) and then upgraded to VL53L1X ToF sensors for improved
+accuracy and polling speed.
+
+3.5 Pin Summary
+
+  Signal                  | GPIO
+  ------------------------|-----
+  Outer tripwire (analog) |  32
+  Inner tripwire (analog) |  33
+  ToF sensor 1 XSHUT      |  25
+  ToF sensor 2 XSHUT      |  26
+  I2C SDA                 |  21
+  I2C SCL                 |  22
+
+
+4. Software Design
+
+4.1 Concurrency Architecture
+
+The ESP32 runs two tasks in parallel using FreeRTOS:
+
+  - Core 1 (Arduino loop()) -- Reads the tripwire and ToF sensors, runs the direction-detection
+    and two-person logic, and updates a shared counter variable.
+  - Core 0 (WiFi task) -- Connects to the access point, opens a TCP connection to the server
+    (192.168.4.1:80), and continuously reads the shared counter to push updates.
+
+Inter-core data sharing is handled through a shared_uint32 struct defined in sharedVariable.h,
+which pairs a uint32_t value with a FreeRTOS SemaphoreHandle_t mutex. The macros
+LOCK_SHARED_VARIABLE and UNLOCK_SHARED_VARIABLE wrap xSemaphoreTake and xSemaphoreGive
+respectively, ensuring the sensing core never reads a half-written count and the WiFi core
+never observes a torn write.
+
+4.2 Direction Detection Algorithm
+
+The tripwire state machine tracks two variables, firstTrigger and lastTrigger, which record
+which beam (1 = inner, 2 = outer) was broken first and most recently:
+
+  - If outer breaks before inner -> firstTrigger = 2, lastTrigger = 1 on completion
+    -> entry, count += delta.
+  - If inner breaks before outer -> firstTrigger = 1, lastTrigger = 2 on completion
+    -> exit, count -= delta (floor of 0).
+
+A crossing is considered complete when both beams return to clear simultaneously with a
+non-zero firstTrigger. Both variables are reset to 0 at the end of each crossing.
+
+4.3 Two-Person Detection
+
+During any active sensing window (opened when either tripwire or ToF sensor is triggered),
+the software compares the timestamps of when each ToF sensor last reported a blocked reading.
+If both sensors triggered within a 500 ms window of each other (TWO_PERSON_WINDOW_MS),
+twoPeopleMode is set to true and delta is set to 2 instead of 1 for the crossing. After a
+two-person event, a 2,000 ms cooldown (TWO_PERSON_COOLDOWN_MS) is applied to ignore the
+second person's residual tripwire break.
+
+4.4 Debouncing
+
+Tripwire readings use a software debounce counter (debounceCount = 1 in the final version).
+A beam is only marked as broken after the analog value reads below 1,000 for the required
+number of consecutive loop iterations, preventing noise from triggering false crossings.
+The clear state requires the value to exceed 1,500, providing hysteresis between the two
+thresholds.
+
+4.5 WiFi Communication Protocol
+
+The WiFi task connects as a client to an ESP32 access point (SSID: team0017, password: team0017)
+and then opens a TCP socket to the server at 192.168.4.1 on port 80. Count updates are sent
+as the ASCII string "#N\n", where N is the current integer count. After each transmission, the
+client reads a one-character response: if the server replies with 'r', the device clears the
+count in non-volatile memory (using the ESP32 Preferences library) and calls ESP.restart(),
+resetting the counter to zero on reboot.
+
+4.6 Non-Volatile Persistence
+
+The reboot handler stores the reset count of 0 in the ESP32's NVS flash partition under the
+namespace "nonVolData" with key "count". This ensures that a server-issued reset survives a
+power cycle without requiring the server to re-send the reset command.
+
+
+5. Testing and Results
+
+5.1 Overview
+
+The system was evaluated during a live final demo. All required test cases passed with the
+exception of intermittent glitches observed in the sensor-blocked test case, described below.
+
+5.2 Single-Person Entry and Exit Accuracy
+
+Single-person entry and exit detection passed consistently during the demo. The direction
+detection algorithm correctly identified entry (outer beam first, inner beam last) and exit
+(inner beam first, outer beam last) sequences across all trials.
+
+5.3 Two-Person Detection Accuracy
+
+The two-person simultaneous crossing test passed. When two people crossed side by side within
+the 500 ms window, both ToF sensors registered blocked readings in time and twoPeopleMode was
+activated, resulting in a count increment or decrement of 2.
+
+5.4 WiFi Transmission Reliability
+
+WiFi transmission performed reliably throughout the demo. Count updates were delivered to the
+server in real time with no observed dropped connections during normal operation.
+
+5.5 Sensor Blocked Case
+
+The sensor-blocked test case — where a person stands still and holds a tripwire beam broken
+without completing a crossing — exposed a gap in the state machine. The system sets firstTrigger
+when the first beam breaks but only resolves a crossing when both beams return to clear. No
+timeout or recovery path exists for the case where the person stops mid-doorway. The system
+remains in a pending-crossing state indefinitely, and if the person eventually moves through,
+the stale firstTrigger from the original stop is used to determine direction, which may produce
+an incorrect count. All other test cases passed without issue.
+
+
+6. Discussion
+
+6.1 Design Decisions
+
+The choice to use FreeRTOS dual-core tasking rather than a single-loop polling approach was
+driven by the latency requirement for WiFi transmission. Blocking calls inside connect_to_server
+(which retries indefinitely on connection failure) would have halted the sensing loop, causing
+missed crossings. Pinning the WiFi task to core 0 and the sensing loop to core 1 avoids this
+entirely.
+
+The transition from ultrasonic sensors to VL53L1X ToF sensors improved two-person detection
+reliability. Ultrasonic sensors introduce a 10 us pulse and then block on pulseIn for up to
+23,200 us per measurement, adding roughly 46 ms of blocking delay per loop iteration when both
+sensors are polled. The VL53L1X uses a data-ready interrupt and non-blocking reads polled at a
+100 ms rate, allowing the tripwire state machine to run without sensing delays.
+
+The sensingWindowUntil extension mechanism prevents false negatives where a person is already
+mid-crossing when the loop starts. By keeping the sensing window open for 1,000 ms after any
+activity ceases, the system continues to evaluate two-person conditions even if the ToF data
+becomes momentarily unavailable (e.g., sensor returns no-object on the frame where a person is
+directly overhead).
+
+6.2 Limitations
+
+The direction algorithm requires that one beam fully clears before the other is triggered in
+order to unambiguously record firstTrigger. A very wide person or a person moving diagonally
+can break both beams simultaneously, leaving firstTrigger ambiguous. In the current
+implementation such a crossing is still resolved using the lastTrigger, but the result may be
+incorrect.
+
+The count floor of 0 prevents the counter from going negative but does not indicate an error
+condition. A sequence of exits at startup (before any entries are recorded) will silently
+saturate at zero rather than indicating a misconfiguration.
+
+The crossing state machine has no timeout for an incomplete crossing. If a person stops and
+holds a tripwire beam broken without completing the full outer-to-inner or inner-to-outer
+sequence, firstTrigger is set but the resolution condition (both beams clear) never fires.
+The system remains stuck in that pending state until the beams clear, and any subsequent
+movement through the door uses the stale firstTrigger, potentially producing a wrong direction
+and an incorrect count delta.
+
+6.3 Potential Improvements
+
+The stuck-crossing glitch observed during the demo could be addressed by adding a crossing
+timeout. If firstTrigger is set but both beams have not cleared within a configurable window
+(e.g., 5 000 ms), the state machine would reset firstTrigger and lastTrigger to 0 and discard
+the pending crossing. This would prevent a person standing still in the doorway from corrupting
+the direction state for all subsequent crossings.
+
+The direction detection logic could be made more robust to simultaneous beam breaks by
+recording the exact timestamp of each beam's first break rather than relying on loop-iteration
+ordering. This would allow the system to resolve ambiguous cases based on which beam triggered
+even a few milliseconds earlier, rather than declaring the direction unknown.
+
+Persistent occupancy across reboots is currently not supported — the count resets to 0 on
+every restart unless a server-issued reset is received. Storing the running count in NVS on
+each update (not only on a reset command) would allow the system to restore the last known
+count after an unexpected power loss.
+
+
+7. Conclusion
+
+This project successfully implemented a real-time, wireless people counter using an ESP32
+microcontroller, dual IR tripwire beams, and a pair of VL53L1X Time-of-Flight sensors. The
+system correctly detects entry and exit direction by tracking the sequence in which the two
+tripwire beams are broken, and handles simultaneous two-person crossings by monitoring whether
+both ToF sensors register blocked readings within a 500 ms window.
+
+The dual-core FreeRTOS architecture proved essential for keeping the sensing loop responsive
+while WiFi transmission ran independently on the second core. Over the course of the project,
+the secondary sensor subsystem was iterated from HC-SR04 ultrasonic sensors to VL53L0X and
+finally VL53L1X ToF sensors, each iteration improving measurement speed and reducing loop
+blocking time.
+
+All required demo test cases passed. The one observed failure mode — glitches when a person
+stands still and holds a tripwire beam broken without completing a crossing — is understood and
+traceable to the absence of a crossing timeout in the state machine. Adding a timeout to reset
+the pending-crossing state would resolve this in a future revision. The core counting
+functionality operated reliably throughout all other testing and met the project requirements.
+
+
+8. References
+
+[Leave blank -- fill in with datasheets, library references, course materials cited]
+
+
+Appendix A: Source Code
+
+The full Arduino sketch is structured across the following files:
+
+  - PeopleCounterToF_v2/PeopleCounterToF_v2.ino  -- Main sensing and counting logic (final version)
+  - PeopleCounterToF_v2/WirelessCommunication.cpp/.h  -- WiFi client task
+  - PeopleCounterToF_v2/sharedVariable.h  -- FreeRTOS shared variable macros
+
+Earlier iterations are preserved in:
+  - Working_V1/   -- Tripwire + HC-SR04 ultrasonic sensors
+  - PeopleCounter/  -- Refined ultrasonic version with sensing window
+  - PeopleCounter_tof/  -- Tripwire + VL53L0X sensors
+
+Test sketches:
+  - TripwireTest/TripwireTest.ino
+  - UltrasonicTest/UltrasonicTest.ino
+  - ToFTest/ToFTest.ino
